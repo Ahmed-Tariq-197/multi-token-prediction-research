@@ -1,0 +1,8 @@
+# CPU smoke configuration for synthetic data (python scripts/make_synthetic_data.py --out data/synthetic)
+name: smoke
+seed: 1
+model: {vocab_size: 64, d_model: 64, n_layers: 2, n_heads: 4, ffn_hidden: 128, max_seq_len: 64, num_pred_heads: 2}
+data: {train_bin: data/synthetic/train.bin, val_bin: data/synthetic/val.bin, test_bin: data/synthetic/test.bin,
+       manifest: data/synthetic/manifest.json, seq_len: 64, max_horizon: 4}
+train: {total_tokens: 65536, global_batch_tokens: 2048, micro_batch_size: 16, lr: 0.003, warmup_steps: 4,
+        precision: fp32, device: cpu, eval_every: 16, ckpt_every: 16, log_every: 4, out_dir: runs/smoke}
