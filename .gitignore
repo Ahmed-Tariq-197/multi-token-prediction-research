@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+data/
+runs/
+*.bin
+*.pt
+*.tmp
+.ipynb_checkpoints/
+
+# Python packaging artifacts
+*.egg-info/

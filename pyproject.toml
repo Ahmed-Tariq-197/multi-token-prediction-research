@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mtp-research"
+version = "0.1.0"
+description = "AIE417: Base NTP, Standard MTP and (Phase 2) Improved MTP under a controlled setup"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2", "numpy", "pyyaml", "tokenizers"]
+
+[project.optional-dependencies]
+dev = ["pytest", "transformers"]
+data = ["datasets", "huggingface_hub"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
