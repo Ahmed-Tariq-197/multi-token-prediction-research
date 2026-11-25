@@ -1,8 +1,0 @@
-# Pin exact versions from the first successful GPU run (see docs/CALIBRATION.md); lower bounds until then.
-torch>=2.2
-numpy
-pyyaml
-tokenizers
-pytest
-transformers      # only for tests/test_model.py::test_hf_llama_parity
-datasets          # only for scripts/prepare_data.py --source hf

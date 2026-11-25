@@ -1,6 +1,0 @@
-forward value soft==hard: True (172.168319809001 vs 172.168319809001)
-head+2: |soft-closedform|=6.66e-16  |soft-explicitKL|=7.77e-16
-head+3: |soft-closedform|=8.88e-16  |soft-explicitKL|=8.88e-16
-head+4: |soft-closedform|=1.17e-15  |soft-explicitKL|=9.99e-16
-trunk grad soft vs explicit-KL: 8.88e-16 | soft vs hard: 2.74e+00
-W grad soft vs hard: 0.00e+00 | soft vs explicit-KL: 3.10e+00
