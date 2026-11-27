@@ -2,11 +2,8 @@
 import itertools
 T4_PEAK = 65e12   # NVIDIA-published fp16 tensor peak for T4 (spec value; sustained is far lower)
 
-def ffn_hidden(d):                       # SwiGLU, ~8/3 d rounded to multiple of 64
-    return int(round(8*d/3/64))*64
-
-def counts(d, L, V, k, ctx=1024):
-    h = ffn_hidden(d)
+def counts(d, L, V, k, ctx=1024, h=1408):          # h = SwiGLU hidden size; 1408 is configs/*.yaml
+    
     block = 4*d*d + 3*d*h                # attn (MHA) + SwiGLU
     emb = V*d
     trunk = L*block
@@ -50,7 +47,7 @@ for D in (0.1e9,0.3e9,1.0e9):
     for mfu in (0.08,0.15,0.25):
         fl = 6*pre*D + 6*2048*d*L*D/2048*1.0  # attn term approx with ctx 2048
         # add k=4 heads: 3 extra (1 block + unembed matmul)
-        block = 4*d*d + 3*int(round(8*d/3/64))*64*d
+        block = 4*d*d + 3*1536*d                    # SmolLM2-135M intermediate_size = 1536 (from its config)
         fl4 = fl + 6*3*(block+V*d)*D
         print(f"D={D/1e9:.1f}B ({D/pre:5.1f} tok/param; {D/2e12:.4%} of its pretraining) MFU {mfu:.0%}: NTP {fl/(T4_PEAK*mfu)/3600:6.1f} h | MTP-k4 {fl4/(T4_PEAK*mfu)/3600:6.1f} h")
 

@@ -9,8 +9,8 @@ Evidence labels: **[verified]** read in the source / executed here · **[reporte
 |---|---|---|
 | Example | 29.9M-param main path, V=8192, d=512, L=8 | SmolLM2-135M (134.5M params, 2T pretraining tokens [verified, HF model card]) |
 | Tokens / param | 10–20 (final value from calibration) | 0.3B tokens = 2.2 tok/param, i.e. 0.015% of its pretraining |
-| GPU-h per run [estimate, 15% MFU] | ~1.7 (NTP) / ~2.8 (k=4) at 10 tok/param | ~6.9 (NTP) / ~11.9 (k=4) at 0.3B tokens |
-| Runs affordable (7 arms × 3 seeds) | ~53 GPU-h total | ~250 GPU-h total → effectively 1 seed |
+| GPU-h per run [estimate, 15% MFU] | ~1.7 (NTP) / ~3.0 (k=4) at 10 tok/param | ~6.9 (NTP) / ~11.9 (k=4) at 0.3B tokens |
+| Runs affordable (7 arms × 3 seeds) | ~55 GPU-h total | ~220 GPU-h total → effectively 1 seed |
 | What it tests | Effect of the objective on a trunk trained *under* it | Effect of adapting heads/trunk of a trunk already shaped by 2T NTP tokens |
 
 Decision: from scratch is the primary controlled study because MTP is a pretraining objective, identical random
@@ -26,7 +26,9 @@ reached; byte-level BPE **V=8192 trained on train text only**, EOS = id 0; uint1
 revision (must be pinned), tokenizer hash, counts, bytes/token (for BPB). V=8192 rather than 16k/32k because at d=512
 the unembedding matmul dominates head cost (ADR-003). Open: V changes how hard MTP is (the curriculum paper argues
 byte-level inputs make MTP easier for small models [reported]); we do not ablate V — listed as a limitation.
-The `hf` ingestion path is **unexecuted** in the authoring environment; the offline path is tested.
+The `hf` ingestion path is **unexecuted** in the authoring environment; the offline path is tested (hash split, train-only
+tokenizer with a positive control, UTF-8 round trip, EOS-literal stripping so web text cannot inject document boundaries,
+uint16 bound, per-file SHA-256 in the manifest). Training refuses data whose manifest disagrees with the config.
 
 ## ADR-003 Architecture
 Llama-style (RMSNorm, RoPE, SwiGLU, tied unembedding), own implementation, validated against
@@ -36,8 +38,8 @@ all share the tied unembedding W. Not DeepSeek-style sequential modules: the spe
 maps directly onto parallel heads, drafting needs one trunk pass, and tests are unambiguous. Sequential heads remain an
 optional Phase 2 ablation.
 **Compute fact [estimate, verify in calibration]:** at this scale the unembedding matmul (V·d = 4.2M MACs/token) is larger
-than a transformer block (3.2M), so each extra head adds ~24% to the per-token FLOPs of a base step; k=4 costs ≈1.7× FLOPs/token of NTP
-(≈2.0× with V=16k). At 7B this overhead is ~0 because V·d is ~2% of the model. Consequence: *equal-token* comparisons give
+than a transformer block (3.2M), so each extra head adds ~23% to the per-token FLOPs of a base step (k=2: 1.23×); k=4 costs ≈1.70× FLOPs/token of NTP
+(≈1.95× with V=16k). Source: docs/validation/budget_math.py with the shipped d=512, L=8, ffn=1408. At 7B this overhead is ~0 because V·d is ~2% of the model. Consequence: *equal-token* comparisons give
 MTP more compute; we report FLOPs and wall-clock for every arm and add a compute-matched NTP control in Phase 2.
 
 ## ADR-004 Notation and objective (resolves the head-count ambiguity)
@@ -59,7 +61,7 @@ one-hot realised token, implemented by straight-through routing of the NTP loss 
 Evidence:
 - Identity verified **by us** in fp64 with code independent of the authors': head and trunk gradients equal the closed form
   `λ/(K·n)·(p_k − q)ᵀW` and an explicit KL(q‖p) objective to ~1e-15; forward loss unchanged; gradient on shared W
-  differs from explicit KL, equals hard MTP [verified; script and output in docs/validation/]. The authors' own
+  differs from explicit KL, equals hard MTP [verified; script + recorded output in docs/validation/, enforced in CI by tests/test_validation_artifacts.py]. The authors' own
   17 identity tests also pass on our machine [verified]. Official code (MIT) exists: github.com/JaydenTeoh/Soft-MTP.
 - Their results [reported, not reproduced]: 167M–1.2B models, 31.5B tokens, Muon optimizer, bf16, sequential heads,
   untied embeddings. 167M FineWeb-Edu PPL: NTP 15.23, MTP 15.98, Soft-MTP 15.95 — i.e. ~0.2% over MTP and still 4.7% behind
@@ -123,9 +125,19 @@ See docs/CALIBRATION.md. Session facts [reported by third-party sources; Kaggle'
 each account's meter. Budget constraint set: slowest arm ≤ 5 h per run, ≤ 20 tokens/param, campaign ≤ 60% of team quota.
 
 ## ADR-009 Repository workflow
-Local work on `wip/*` branches with member-attributed commits, never pushed. At the audit gate: clean history preserving
-authorship, push `phase1`, merge to `main` with `--no-ff`, tag `phase1-v1.0`. `main` already holds GitHub's initial README
-commit; it is preserved. See docs/WORKFLOW.md.
+State found on `origin`: `main` = README commit + PR #1 (first scaffold) + PR #2 (revert of #1). Consequences: (1) never
+re-merge `phase1/initial-scaffold` (already an ancestor; the merge would be a no-op and the revert would stand) —
+the audit branch re-applies the scaffold by cherry-pick (original author kept) and stacks audit commits on top; (2) the
+stage branch cannot be called `phase1` (ref collides with `phase1/initial-scaffold`, verified) → `stage/phase1`.
+Flow: `feat/*` → `stage/phaseN` (PR, CI, reviewer ≠ author) → `main` (merge commit, tag) after the audit checklist.
+Per-member authorship stays in history; AI-assisted commits are labelled by author/trailer. Branch protection must be
+enabled by the repo owner (see CONTRIBUTING.md). Details: docs/WORKFLOW.md.
+
+## ADR-010 Run-integrity rules (added by the engineering audit; each has a regression test)
+Finished runs are immutable; resume is exact on CPU and refuses trajectory-config drift; logs are truncated to the
+checkpoint on resume; non-finite steps are skipped (fp32/bf16) or scaler-skipped (fp16) and counted, 10 consecutive abort;
+checkpoints are versioned and self-describing (`model_config`), loaded with `weights_only=True`; test-split results are
+written once (`--force` required to replace). Rationale and the defects that motivated each rule: docs/ENGINEERING_AUDIT.md.
 
 ## Unresolved uncertainties (to be closed by experiment)
 1. Achieved T4 throughput, memory, fp16 stability of MTP training (calibration).
@@ -135,6 +147,9 @@ commit; it is preserved. See docs/WORKFLOW.md.
 5. Whether Soft-MTP transfers to parallel heads, AdamW, fp16, ≤50M params, ≤20 tok/param.
 6. Whether the T4×2 session counts quota per GPU or per wall-hour, and whether two concurrent runs are practical.
 7. HF streaming ingestion path and dataset revision pinning (unexecuted here).
+8. Everything on CUDA/fp16: mixed-precision numerics, GradScaler behaviour, torch.compile on sm_75, memory per micro-batch.
+   (CPU bf16 autocast is used in tests only as a proxy for dtype handling, not as evidence of GPU behaviour.)
+9. Windows behaviour: path/encoding/line-ending fixes are in place but only CI on a Windows runner can confirm them.
 
 ## References
 Gloeckle et al. 2024, arXiv:2404.19737 · Aynetdinov & Akbik, ACL 2025, arXiv:2505.22757 · Teoh 2026, "Multi-Token Prediction
