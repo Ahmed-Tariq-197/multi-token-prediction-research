@@ -1,0 +1,5 @@
+# Single source of truth for dependencies is pyproject.toml. This file exists for Colab/Kaggle notebooks:
+#   pip install -r requirements.txt
+# Colab/Kaggle ship a CUDA build of torch; if you must install one yourself pick the wheel matching the machine
+# (https://pytorch.org/get-started/locally/). Pin exact versions of the first successful GPU run in docs/RUN_PROTOCOL.md.
+-e .[dev,data]

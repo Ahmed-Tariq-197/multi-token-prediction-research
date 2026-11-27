@@ -1,0 +1,30 @@
+== per-token cost and parameter counts (d=512, L=8, ctx=1024) ==
+V= 8192 k=1: params(infer path)=  29.9M  params(train)=  29.9M  FLOPs/token=  204.5M  vs NTP x1.00
+V= 8192 k=2: params(infer path)=  29.9M  params(train)=  33.1M  FLOPs/token=  252.1M  vs NTP x1.23
+V= 8192 k=4: params(infer path)=  29.9M  params(train)=  39.5M  FLOPs/token=  347.2M  vs NTP x1.70
+V=16384 k=1: params(infer path)=  34.1M  params(train)=  34.1M  FLOPs/token=  229.6M  vs NTP x1.00
+V=16384 k=2: params(infer path)=  34.1M  params(train)=  37.3M  FLOPs/token=  302.4M  vs NTP x1.32
+V=16384 k=4: params(infer path)=  34.1M  params(train)=  43.7M  FLOPs/token=  447.9M  vs NTP x1.95
+
+== scratch plan: tokens/param and GPU-hours per run (V=8192, d=512, L=8) ==
+Base NTP N=29.9M params
+tok/param  tokens   | MFU   8%: NTP / MTP-k4 h | MFU  15%: NTP / MTP-k4 h | MFU  25%: NTP / MTP-k4 h
+    5        149M |              1.6 /   2.8 |              0.9 /   1.5 |              0.5 /   0.9
+   10        299M |              3.3 /   5.5 |              1.7 /   3.0 |              1.0 /   1.8
+   20        598M |              6.5 /  11.1 |              3.5 /   5.9 |              2.1 /   3.5
+
+== continued pretraining alternative: SmolLM2-135M (134.5M params, V=49152, 2T pretraining tokens) ==
+D=0.1B (  0.7 tok/param; 0.0050% of its pretraining) MFU 8%: NTP    4.3 h | MTP-k4    7.4 h
+D=0.1B (  0.7 tok/param; 0.0050% of its pretraining) MFU 15%: NTP    2.3 h | MTP-k4    4.0 h
+D=0.1B (  0.7 tok/param; 0.0050% of its pretraining) MFU 25%: NTP    1.4 h | MTP-k4    2.4 h
+D=0.3B (  2.2 tok/param; 0.0150% of its pretraining) MFU 8%: NTP   12.9 h | MTP-k4   22.2 h
+D=0.3B (  2.2 tok/param; 0.0150% of its pretraining) MFU 15%: NTP    6.9 h | MTP-k4   11.9 h
+D=0.3B (  2.2 tok/param; 0.0150% of its pretraining) MFU 25%: NTP    4.1 h | MTP-k4    7.1 h
+D=1.0B (  7.4 tok/param; 0.0500% of its pretraining) MFU 8%: NTP   43.1 h | MTP-k4   74.2 h
+D=1.0B (  7.4 tok/param; 0.0500% of its pretraining) MFU 15%: NTP   23.0 h | MTP-k4   39.6 h
+D=1.0B (  7.4 tok/param; 0.0500% of its pretraining) MFU 25%: NTP   13.8 h | MTP-k4   23.7 h
+
+== how many runs fit? (scratch, V=8192, 10 tok/param, MFU scenario 15%) ==
+{'NTP': 1.74, 'MTP k4': 2.96, 'Soft-MTP k4': 2.96, 'param-matched NTP': 2.18, 'MTP k2': 2.35, 'KL-MTP k4': 3.25, 'MTP k4+curriculum': 2.96} 
+Total for 3 seeds x 7 arms = 55 GPU-h
+Sustained weekly capacity if 4 accounts x 30h/week x ~1 concurrent run = 120 h (optimistic; quota is floating, T4x2 concurrency unverified)
