@@ -6,19 +6,21 @@ Protocol (docs/CALIBRATION.md): synthetic random token windows (throughput does 
 the same loss/optimizer code path as training, warm-up steps discarded, torch.cuda.synchronize around the timed
 region, OOM caught and recorded. Output is consumed by scripts/budget.py. Nothing here is a model-quality result.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from mtp.config import load_config  # noqa: E402
-from mtp.evaluate import autocast_ctx  # noqa: E402
+from mtp.evaluate import autocast_ctx, effective_precision  # noqa: E402
 from mtp.loss import multi_head_loss  # noqa: E402
 from mtp.model import MTPModel  # noqa: E402
 from mtp.targets import build_head_targets  # noqa: E402
@@ -27,8 +29,7 @@ from mtp.utils import atomic_save, env_info  # noqa: E402
 
 
 def trial(cfg, k, micro, compile_, steps, warmup, device, precision):
-    cfg.model.num_pred_heads, cfg.train.micro_batch_size = k, micro
-    cfg.data.max_horizon = max(cfg.data.max_horizon, k)
+    """`cfg` already carries this trial's k / micro-batch (built through load_config overrides, so it is validated)."""
     d = cfg.data
     model = MTPModel(cfg.model, init_seed=0).to(device)
     opt = build_optimizer(model, cfg, device)
@@ -43,30 +44,45 @@ def trial(cfg, k, micro, compile_, steps, warmup, device, precision):
         window = torch.randint(1, V, (micro, d.seq_len + d.max_horizon), device=device)
         tg = build_head_targets(window, d.seq_len, k, cfg.model.eos_id)
         with autocast_ctx(device, precision):
-            hs = fwd(window[:, :d.seq_len])
+            hs = fwd(window[:, : d.seq_len])
             loss, _ = multi_head_loss(hs, model.embed_tokens.weight, tg, cfg.loss.lam)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
+        scaler.step(opt)
+        scaler.update()
+        opt.zero_grad(set_to_none=True)
 
     for _ in range(warmup):
         step()
-    sync(); t0 = time.perf_counter()
+    sync()
+    t0 = time.perf_counter()
     for _ in range(steps):
         step()
-    sync(); dt = time.perf_counter() - t0
+    sync()
+    dt = time.perf_counter() - t0
     tok = steps * micro * d.seq_len
     # checkpoint round trip
-    p = "/tmp/_calib_ckpt.pt"
-    t1 = time.perf_counter(); atomic_save({"model": model.state_dict(), "opt": opt.state_dict()}, p)
-    save_s = time.perf_counter() - t1
-    size_mb = os.path.getsize(p) / 2**20; os.remove(p)
-    return {"k": k, "micro_batch": micro, "compile": compile_, "precision": precision,
-            "tokens_per_s": tok / dt, "step_ms": 1000 * dt / steps,
-            "peak_mem_gb": torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else None,
-            "ckpt_save_s": save_s, "ckpt_mb": size_mb, "oom": False,
-            "params_main": model.num_params(False), "params_total": model.num_params(True)}
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "calib_ckpt.pt")
+        t1 = time.perf_counter()
+        atomic_save({"model": model.state_dict(), "opt": opt.state_dict()}, p)
+        save_s = time.perf_counter() - t1
+        size_mb = os.path.getsize(p) / 2**20
+    return {
+        "k": k,
+        "micro_batch": micro,
+        "compile": compile_,
+        "precision": precision,
+        "tokens_per_s": tok / dt,
+        "step_ms": 1000 * dt / steps,
+        "peak_mem_gb": torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else None,
+        "ckpt_save_s": save_s,
+        "ckpt_mb": size_mb,
+        "oom": False,
+        "params_main": model.num_params(False),
+        "params_total": model.num_params(True),
+    }
 
 
 def main() -> None:
@@ -81,20 +97,25 @@ def main() -> None:
     ap.add_argument("--out", default="calibration.json")
     a = ap.parse_args()
     results = []
+    seq_len = load_config(a.config, a.set).data.seq_len
+    horizon = load_config(a.config, a.set).data.max_horizon
     for k in a.k:
         for mb in a.micro_batch:
             for comp in a.compile:
-                cfg = load_config(a.config, a.set + [f"train.global_batch_tokens={mb * load_config(a.config, a.set).data.seq_len}"])
+                overrides = a.set + [f"model.num_pred_heads={k}", f"data.max_horizon={max(horizon, k)}",
+                                     f"train.micro_batch_size={mb}", f"train.global_batch_tokens={mb * seq_len}"]
+                cfg = load_config(a.config, overrides)
                 device = cfg.train.device or ("cuda" if torch.cuda.is_available() else "cpu")
-                precision = cfg.train.precision if device == "cuda" else "fp32"
+                precision = effective_precision(cfg, device)
                 try:
                     r = trial(cfg, k, mb, bool(comp), a.steps, a.warmup, device, precision)
                 except torch.cuda.OutOfMemoryError:
                     torch.cuda.empty_cache()
                     r = {"k": k, "micro_batch": mb, "compile": bool(comp), "oom": True}
-                print(json.dumps(r)); results.append(r)
+                print(json.dumps(r))
+                results.append(r)
     out = {"env": env_info(), "config": a.config, "overrides": a.set, "trials": results}
-    with open(a.out, "w") as f:
+    with open(a.out, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
     print(f"wrote {a.out}")
 

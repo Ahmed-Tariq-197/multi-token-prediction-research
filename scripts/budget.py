@@ -29,10 +29,12 @@ def derive_budget(trials: list[dict], arms: list[tuple[str, int, float]], seeds:
                   max_run_hours: float = 5.0, eval_overhead: float = 0.05, max_tpp: float = 20.0,
                   min_tpp: float = 5.0, weekly_quota: float = 30.0, accounts: int = 1,
                   campaign_fraction: float = 0.6, mem_cap_gb: float | None = None) -> dict:
-    tps, n_main = {}, None
+    tps, n_main, chosen = {}, None, {}
     for name, k, mult in arms:
         t = best_trial(trials, k, mem_cap_gb)
         tps[name] = t["tokens_per_s"] / mult
+        chosen[name] = {"k": k, "micro_batch": t.get("micro_batch"), "compile": t.get("compile"),
+                        "peak_mem_gb": t.get("peak_mem_gb"), "cost_multiplier": mult}
         n_main = t["params_main"]
     eff = 1.0 - eval_overhead
     d_time = min(v * max_run_hours * 3600 * eff for v in tps.values())
@@ -50,7 +52,8 @@ def derive_budget(trials: list[dict], arms: list[tuple[str, int, float]], seeds:
     if d / n_main < min_tpp:
         warn.append(f"tokens/param = {d / n_main:.1f} < {min_tpp}: models would be undertrained; revisit the plan")
     return {"tokens_per_run": d, "steps_per_run": d // global_batch_tokens, "tokens_per_param": d / n_main,
-            "binding_constraint": binding, "tokens_per_s_by_arm": tps, "hours_per_run_by_arm": hours,
+            "binding_constraint": binding, "tokens_per_s_by_arm": tps, "calibration_trial_used": chosen,
+            "hours_per_run_by_arm": hours,
             "campaign_gpu_hours": total, "campaign_quota_available": cap_hours,
             "weeks_of_team_quota": total / (weekly_quota * accounts), "n_params_main": n_main, "warnings": warn}
 
@@ -71,7 +74,7 @@ def main() -> None:
     for s in a.arm:
         p = s.split(":")
         arms.append((p[0], int(p[1]), float(p[2]) if len(p) > 2 else 1.0))
-    trials = json.load(open(a.calib))["trials"]
+    trials = json.loads(open(a.calib, encoding="utf-8").read())["trials"]
     print(json.dumps(derive_budget(trials, arms, a.seeds, global_batch_tokens=a.global_batch_tokens,
                                    max_run_hours=a.max_run_hours, weekly_quota=a.weekly_quota, accounts=a.accounts,
                                    campaign_fraction=a.campaign_fraction, mem_cap_gb=a.mem_cap_gb), indent=2))

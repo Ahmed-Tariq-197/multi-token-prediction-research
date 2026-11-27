@@ -19,11 +19,53 @@ import hashlib
 import json
 import os
 import time
-from typing import Iterator
+from collections.abc import Iterator
 
 import numpy as np
 
 EOS = "<|endoftext|>"
+
+
+def file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 24), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def sanitize(text: str) -> tuple[str, bool]:
+    """The tokenizer parses the literal special-token string inside text as the real EOS id. A web document that
+    happens to contain it would inject a fake document boundary (and corrupt cross-document masking), so strip it."""
+    return (text.replace(EOS, ""), True) if EOS in text else (text, False)
+
+
+def encode_split(tok, raw_path: str, bin_path: str, vocab_size: int, batch_size: int = 512) -> tuple[int, int, int]:
+    """Tokenise one split's raw jsonl into a uint16 .bin (EOS id 0 after every document).
+    Returns (tokens written, utf-8 bytes of text, documents whose EOS literal was stripped)."""
+    total_tokens = total_bytes = stripped = 0
+    batch: list[str] = []
+
+    def flush(out) -> None:
+        nonlocal total_tokens, total_bytes
+        for enc, txt in zip(tok.encode_batch(batch), batch, strict=True):
+            ids = enc.ids + [0]
+            assert max(ids) < vocab_size
+            np.asarray(ids, dtype=np.uint16).tofile(out)
+            total_tokens += len(ids)
+            total_bytes += len(txt.encode())
+        batch.clear()
+
+    with open(bin_path, "wb") as out, open(raw_path, encoding="utf-8") as f:
+        for line in f:
+            text, hit = sanitize(json.loads(line)["text"])
+            stripped += int(hit)
+            batch.append(text)
+            if len(batch) >= batch_size:
+                flush(out)
+        if batch:
+            flush(out)
+    return total_tokens, total_bytes, stripped
 
 
 def bucket(doc_id: str) -> int:
@@ -36,7 +78,10 @@ def split_of(doc_id: str, val_pm: int, test_pm: int) -> str:
 
 
 def iter_hf(dataset: str, config: str, revision: str | None, gpt2_budget: int) -> Iterator[tuple[str, str]]:
-    from datasets import load_dataset
+    try:
+        from datasets import load_dataset
+    except ImportError as e:  # pragma: no cover - environment dependent
+        raise SystemExit("`datasets` is required for --source hf: pip install -e \".[data]\"") from e
     ds = load_dataset(dataset, name=config, split="train", streaming=True, revision=revision)
     seen = 0
     for ex in ds:
@@ -47,7 +92,7 @@ def iter_hf(dataset: str, config: str, revision: str | None, gpt2_budget: int) -
 
 
 def iter_jsonl(path: str) -> Iterator[tuple[str, str]]:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             r = json.loads(line)
             yield r["id"], r["text"]
@@ -68,11 +113,16 @@ def main() -> None:
     ap.add_argument("--test-permille", type=int, default=5)
     ap.add_argument("--tok-train-mb", type=int, default=300, help="MB of TRAIN text used to fit the BPE")
     a = ap.parse_args()
+    if not 1 < a.vocab_size <= 65536:
+        raise SystemExit("--vocab-size must be in (1, 65536]: token ids are stored as uint16")
+    if a.source == "hf" and not a.revision:
+        print("[warn] no --revision given: the manifest will not pin the dataset version, so the corpus is not "
+              "strictly reproducible. Pass the dataset's commit hash.")
 
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
     os.makedirs(a.out, exist_ok=True)
-    raw = {s: open(os.path.join(a.out, f"raw_{s}.jsonl"), "w") for s in ("train", "val", "test")}
+    raw = {s: open(os.path.join(a.out, f"raw_{s}.jsonl"), "w", encoding="utf-8") for s in ("train", "val", "test")}
     docs = iter_hf(a.dataset, a.config, a.revision, a.gpt2_token_budget) if a.source == "hf" else iter_jsonl(a.jsonl)
     n_docs = {"train": 0, "val": 0, "test": 0}
     t0 = time.time()
@@ -87,9 +137,9 @@ def main() -> None:
     # ---- tokenizer on train text only
     def train_text() -> Iterator[str]:
         used = 0
-        with open(os.path.join(a.out, "raw_train.jsonl")) as f:
+        with open(os.path.join(a.out, "raw_train.jsonl"), encoding="utf-8") as f:
             for line in f:
-                t = json.loads(line)["text"]
+                t = sanitize(json.loads(line)["text"])[0]
                 used += len(t.encode())
                 yield t
                 if used >= a.tok_train_mb * 2**20:
@@ -110,35 +160,18 @@ def main() -> None:
     manifest = {"source": a.source, "dataset": a.dataset if a.source == "hf" else a.jsonl, "config": a.config,
                 "revision": a.revision, "split_rule": f"sha256(id)%1000 < {a.val_permille} val; "
                 f"< {a.val_permille + a.test_permille} test; else train", "vocab_size": a.vocab_size, "eos_id": 0,
-                "tokenizer_sha256": tok_sha, "docs": n_docs, "tokens": {}, "bytes_per_token": {},
+                "tokenizer_sha256": tok_sha, "docs": n_docs, "tokens": {}, "bytes_per_token": {}, "sha256": {},
+                "docs_with_eos_literal_stripped": 0,
                 "created_unix": time.time()}
     for s in ("train", "val", "test"):
-        total_tokens, total_bytes = 0, 0
-        out = open(os.path.join(a.out, f"{s}.bin"), "wb")
-        batch: list[str] = []
-
-        def flush():
-            nonlocal total_tokens, total_bytes
-            if not batch:
-                return
-            for enc, txt in zip(tok.encode_batch(batch), batch):
-                ids = enc.ids + [0]
-                np.asarray(ids, dtype=np.uint16).tofile(out)
-                total_tokens += len(ids)
-                total_bytes += len(txt.encode())
-            batch.clear()
-
-        with open(os.path.join(a.out, f"raw_{s}.jsonl")) as f:
-            for line in f:
-                batch.append(json.loads(line)["text"])
-                if len(batch) >= 512:
-                    flush()
-        flush()
-        out.close()
+        total_tokens, total_bytes, stripped = encode_split(tok, os.path.join(a.out, f"raw_{s}.jsonl"),
+                                                           os.path.join(a.out, f"{s}.bin"), a.vocab_size)
+        manifest["docs_with_eos_literal_stripped"] += stripped
         manifest["tokens"][s] = total_tokens
+        manifest["sha256"][s] = file_sha256(os.path.join(a.out, f"{s}.bin"))
         manifest["bytes_per_token"][s] = total_bytes / max(total_tokens, 1)
         print(f"[stage 3] {s}: {total_tokens:,} tokens, {total_bytes / max(total_tokens, 1):.3f} bytes/token")
-    with open(os.path.join(a.out, "manifest.json"), "w") as f:
+    with open(os.path.join(a.out, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
 
