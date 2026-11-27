@@ -29,4 +29,4 @@ train:
   eval_every: 500
   eval_windows: 256
   ckpt_every: 500
-  out_dir: runs/base_ntp_s1337
+  out_dir: runs/{name}_s{seed}      # {name}, {seed}, {k} are substituted at load time
