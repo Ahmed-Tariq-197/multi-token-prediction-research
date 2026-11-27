@@ -28,17 +28,20 @@ class TokenFile:
     def train_batch(self, data_seed: int, step: int, micro: int, batch_size: int,
                     seq_len: int, horizon: int) -> torch.Tensor:
         win = seq_len + horizon
-        hi = len(self.tokens) - win
-        assert hi > 0, f"{self.path} has only {len(self.tokens)} tokens"
+        n_offsets = len(self.tokens) - win + 1            # every full window is a candidate, incl. the last one
+        if n_offsets < 1:
+            raise ValueError(f"{self.path} has only {len(self.tokens)} tokens (< one window of {win})")
         rng = np.random.default_rng([data_seed, step, micro])
-        offs = rng.integers(0, hi, size=batch_size)
+        offs = rng.integers(0, n_offsets, size=batch_size)
         arr = np.stack([self.tokens[o:o + win] for o in offs]).astype(np.int64)
         return torch.from_numpy(arr)
 
     def n_eval_windows(self, seq_len: int, horizon: int) -> int:
-        return max(0, (len(self.tokens) - horizon - 1) // seq_len)
+        # window w reads tokens [w*T, w*T + T + H): it fits iff (w+1)*T + H <= len
+        return max(0, (len(self.tokens) - horizon) // seq_len)
 
-    def eval_windows(self, n: int, seq_len: int, horizon: int, start: int = 0, count: int | None = None) -> torch.Tensor:
+    def eval_windows(self, n: int, seq_len: int, horizon: int, start: int = 0,
+                     count: int | None = None) -> torch.Tensor:
         total = min(n, self.n_eval_windows(seq_len, horizon))
         end = total if count is None else min(total, start + count)
         win = seq_len + horizon
@@ -48,6 +51,42 @@ class TokenFile:
 
 def load_manifest(path: str) -> dict:
     if os.path.exists(path):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     return {}
+
+
+def check_data_consistency(cfg) -> dict:
+    """Refuse to train/evaluate on data that does not match the configuration; return provenance for the run record.
+
+    A wrong eos_id silently corrupts document masking; a vocab mismatch gives out-of-range embeddings. Both would
+    otherwise only show up as unexplained numbers, so they are hard errors. A missing manifest is allowed (custom
+    .bin files) but is recorded as `manifest_present: False` and warned about.
+    """
+    d, m = cfg.data, cfg.model
+    prov: dict = {"manifest_present": False}
+    man = load_manifest(d.manifest)
+    if man:
+        prov.update(manifest_present=True, tokenizer_sha256=man.get("tokenizer_sha256"), dataset=man.get("dataset"),
+                    dataset_revision=man.get("revision"), split_rule=man.get("split_rule"))
+        if man.get("vocab_size") != m.vocab_size:
+            raise ValueError(f"manifest vocab_size {man.get('vocab_size')} != model.vocab_size {m.vocab_size}")
+        if man.get("eos_id") != m.eos_id:
+            raise ValueError(f"manifest eos_id {man.get('eos_id')} != model.eos_id {m.eos_id} "
+                             "(document masking would be wrong)")
+    else:
+        print(f"[warn] no manifest at {d.manifest}: vocab/eos/tokenizer provenance not verified")
+    for split, path in (("train", d.train_bin), ("val", d.val_bin)):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"{split} tokens not found: {path} (run scripts/prepare_data.py)")
+        size = os.path.getsize(path)
+        if size % 2:
+            raise ValueError(f"{path}: size {size} is not a multiple of 2 (uint16 tokens)")
+        expect = man.get("tokens", {}).get(split) if man else None
+        if expect is not None and expect * 2 != size:
+            raise ValueError(f"{path}: {size // 2} tokens on disk but manifest says {expect}")
+        head = np.memmap(path, dtype=np.uint16, mode="r")[:2_000_000]
+        if len(head) and int(head.max()) >= m.vocab_size:
+            raise ValueError(f"{path}: token id {int(head.max())} >= vocab_size {m.vocab_size}")
+        prov[f"{split}_tokens"] = size // 2
+    return prov

@@ -11,6 +11,7 @@ Notation used everywhere in this code base (see docs/DECISIONS.md, ADR-004):
 from __future__ import annotations
 
 import ast
+import copy
 import dataclasses
 import hashlib
 import json
@@ -85,8 +86,38 @@ class RunConfig:
         return dataclasses.asdict(self)
 
     def fingerprint(self) -> str:
+        """Hash of the complete configuration (provenance record)."""
         blob = json.dumps(self.to_dict(), sort_keys=True, default=str).encode()
         return hashlib.sha256(blob).hexdigest()[:12]
+
+    def trajectory_dict(self) -> dict:
+        """Only the settings that determine the training trajectory. Machine-specific paths, logging/eval/checkpoint
+        cadence, run name, device and torch.compile are excluded, so a run may legitimately resume on another
+        machine (Colab -> Kaggle) but not under a different seed, model, data protocol, LR schedule or budget."""
+        d = copy.deepcopy(self.to_dict())
+        d.pop("name", None)
+        for k in ("out_dir", "device", "compile", "log_every", "eval_every", "eval_windows", "ckpt_every"):
+            d["train"].pop(k, None)
+        for k in ("train_bin", "val_bin", "test_bin", "manifest"):
+            d["data"].pop(k, None)
+        d["data"]["data_seed"] = self.seed if self.data.data_seed is None else self.data.data_seed
+        return d
+
+    def trajectory_fingerprint(self) -> str:
+        blob = json.dumps(self.trajectory_dict(), sort_keys=True, default=str).encode()
+        return hashlib.sha256(blob).hexdigest()[:12]
+
+
+def config_diff(a: dict, b: dict, prefix: str = "") -> list[str]:
+    """Human-readable list of differing leaves between two (nested) config dicts."""
+    out = []
+    for key in sorted(set(a) | set(b)):
+        va, vb = a.get(key, "<missing>"), b.get(key, "<missing>")
+        if isinstance(va, dict) and isinstance(vb, dict):
+            out += config_diff(va, vb, f"{prefix}{key}.")
+        elif va != vb:
+            out.append(f"{prefix}{key}: {va!r} -> {vb!r}")
+    return out
 
 
 def _build(cls, d: dict):
@@ -107,7 +138,7 @@ def _build(cls, d: dict):
 def load_config(path: str | None, overrides: list[str] | None = None) -> RunConfig:
     raw: dict = {}
     if path:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
     for ov in overrides or []:
         key, _, val = ov.partition("=")
@@ -121,18 +152,38 @@ def load_config(path: str | None, overrides: list[str] | None = None) -> RunConf
             node = node.setdefault(p, {})
         node[parts[-1]] = val
     cfg = _build(RunConfig, raw)
+    cfg.train.out_dir = cfg.train.out_dir.format_map(
+        {"seed": cfg.seed, "name": cfg.name, "k": cfg.model.num_pred_heads})   # e.g. runs/{name}_s{seed}
     validate(cfg)
     return cfg
 
 
 def validate(cfg: RunConfig) -> None:
-    m, d, t = cfg.model, cfg.data, cfg.train
-    assert m.d_model % m.n_heads == 0, "d_model must be divisible by n_heads"
-    assert (m.d_model // m.n_heads) % 2 == 0, "head_dim must be even for RoPE"
-    assert 1 <= m.num_pred_heads <= d.max_horizon, "need 1 <= k <= data.max_horizon"
-    assert d.seq_len <= m.max_seq_len, "seq_len exceeds model max_seq_len"
+    """Fail early (before any GPU time is spent) on settings that would silently invalidate a run."""
+    m, d, t, lo = cfg.model, cfg.data, cfg.train, cfg.loss
+    if m.d_model % m.n_heads:
+        raise ValueError("model.d_model must be divisible by model.n_heads")
+    if (m.d_model // m.n_heads) % 2:
+        raise ValueError("head_dim must be even for RoPE")
+    if not 1 <= m.num_pred_heads <= d.max_horizon:
+        raise ValueError(f"need 1 <= model.num_pred_heads ({m.num_pred_heads}) <= data.max_horizon ({d.max_horizon})")
+    if d.seq_len > m.max_seq_len:
+        raise ValueError("data.seq_len exceeds model.max_seq_len")
+    if not 1 < m.vocab_size <= 65536:
+        raise ValueError("model.vocab_size must be in (1, 65536]: token files are stored as uint16")
+    if not 0 <= m.eos_id < m.vocab_size:
+        raise ValueError("model.eos_id must be a valid token id")
     per_micro = t.micro_batch_size * d.seq_len
-    assert t.global_batch_tokens % per_micro == 0, (
-        f"global_batch_tokens ({t.global_batch_tokens}) must be a multiple of "
-        f"micro_batch_size*seq_len ({per_micro})")
-    assert t.precision in ("fp16", "bf16", "fp32")
+    if t.global_batch_tokens % per_micro:
+        raise ValueError(f"train.global_batch_tokens ({t.global_batch_tokens}) must be a multiple of "
+                         f"micro_batch_size*seq_len ({per_micro})")
+    if t.total_tokens < t.global_batch_tokens:
+        raise ValueError("train.total_tokens must be at least one global batch")
+    if t.precision not in ("fp16", "bf16", "fp32"):
+        raise ValueError("train.precision must be fp16, bf16 or fp32")
+    if min(t.log_every, t.eval_every, t.ckpt_every, t.eval_windows, t.micro_batch_size) < 1:
+        raise ValueError("log_every, eval_every, ckpt_every, eval_windows, micro_batch_size must be >= 1")
+    if t.lr <= 0 or not 0 <= t.min_lr_ratio <= 1 or t.warmup_steps < 0:
+        raise ValueError("need lr > 0, 0 <= min_lr_ratio <= 1, warmup_steps >= 0")
+    if lo.lam < 0:
+        raise ValueError("loss.lam must be >= 0")

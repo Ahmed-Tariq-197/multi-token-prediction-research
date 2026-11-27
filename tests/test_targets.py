@@ -1,22 +1,10 @@
 """Head targets: offset alignment, window layout, and document-aware valid-position masking."""
+import pytest
 import torch
+from helpers import reference_targets
 
-from mtp.targets import IGNORE_INDEX as IGN, build_head_targets, document_segments
-
-
-def reference_targets(window, T, k, eos, mask=True):
-    """Slow, obviously-correct python-loop reference."""
-    B = window.shape[0]
-    out = torch.full((B, k, T), IGN, dtype=torch.long)
-    for b in range(B):
-        toks = window[b].tolist()
-        for t in range(T):
-            for i in range(1, k + 1):
-                j = t + i
-                if mask and eos in toks[t:j]:        # an EOS at positions t..j-1 closes the document before j
-                    continue
-                out[b, i - 1, t] = toks[j]
-    return out
+from mtp.targets import IGNORE_INDEX as IGN
+from mtp.targets import build_head_targets, document_segments
 
 
 def test_offsets_explicit_example():
@@ -31,7 +19,7 @@ def test_offsets_explicit_example():
 
 def test_head1_equals_standard_shifted_next_token():
     window = torch.randint(1, 50, (3, 20))
-    ids, tg = window[:, :16], build_head_targets(window, 16, 1, eos_id=0)
+    _ids, tg = window[:, :16], build_head_targets(window, 16, 1, eos_id=0)
     assert torch.equal(tg[:, 0], window[:, 1:17])
 
 
@@ -78,6 +66,5 @@ def test_segments_definition():
 
 
 def test_window_too_short_raises():
-    import pytest
     with pytest.raises(AssertionError):
         build_head_targets(torch.ones(1, 10, dtype=torch.long), seq_len=8, k=4, eos_id=0)

@@ -3,23 +3,14 @@ import os
 
 import numpy as np
 import torch
+from helpers import run_cfg
 
-from mtp.config import load_config
 from mtp.data import TokenFile
 from mtp.train import train
 
 
 def _cfg(synth_dir, out_dir, k, seed=1, **extra):
-    ov = [f"seed={seed}", f"data.train_bin='{synth_dir}/train.bin'", f"data.val_bin='{synth_dir}/val.bin'",
-          f"data.test_bin='{synth_dir}/test.bin'", f"data.manifest='{synth_dir}/manifest.json'",
-          "data.seq_len=32", "data.max_horizon=4",
-          "model.vocab_size=64", "model.d_model=32", "model.n_layers=2", "model.n_heads=4", "model.ffn_hidden=64",
-          "model.max_seq_len=32", f"model.num_pred_heads={k}",
-          "train.total_tokens=32768", "train.global_batch_tokens=2048", "train.micro_batch_size=8",
-          "train.lr=3e-3", "train.warmup_steps=2", "train.log_every=2", "train.eval_every=8", "train.ckpt_every=4",
-          "train.eval_windows=16", f"train.out_dir='{out_dir}'", "train.precision='fp32'", "train.device='cpu'"]
-    ov += [f"{a}={b}" for a, b in extra.items()]
-    return load_config(None, ov)
+    return run_cfg(synth_dir, out_dir, k, seed, **extra)
 
 
 def test_train_batches_are_pure_functions_of_seed_step_micro(synth_dir):
@@ -62,8 +53,8 @@ def test_smoke_training_learns_and_logs(synth_dir, tmp_path):
 
 
 def test_same_seed_same_trajectory_and_resume_is_exact(synth_dir, tmp_path):
-    a = train(_cfg(synth_dir, tmp_path / "a", k=2, seed=4))
-    b = train(_cfg(synth_dir, tmp_path / "b", k=2, seed=4))
+    train(_cfg(synth_dir, tmp_path / "a", k=2, seed=4))
+    train(_cfg(synth_dir, tmp_path / "b", k=2, seed=4))
     la = [json.loads(l)["loss"] for l in open(tmp_path / "a" / "log.jsonl") if '"train"' in l]
     lb = [json.loads(l)["loss"] for l in open(tmp_path / "b" / "log.jsonl") if '"train"' in l]
     assert la == lb, "two runs with the same seed must be identical on CPU"

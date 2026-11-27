@@ -5,7 +5,8 @@ import torch.nn.functional as F
 
 from mtp.loss import head_ce, head_weights, multi_head_loss
 from mtp.model import MTPModel
-from mtp.targets import IGNORE_INDEX as IGN, build_head_targets
+from mtp.targets import IGNORE_INDEX as IGN
+from mtp.targets import build_head_targets
 
 
 def _setup(tiny_cfg, k, T=16, H=4, B=3, seed=0, with_eos=True):

@@ -1,9 +1,11 @@
-import os, sys
+import os
+import sys
+
 import pytest
-import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from make_synthetic_data import make  # noqa: E402
+
 from mtp.config import ModelConfig  # noqa: E402
 
 

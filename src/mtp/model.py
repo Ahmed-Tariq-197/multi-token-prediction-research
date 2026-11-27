@@ -65,8 +65,12 @@ class Attention(nn.Module):
 
     def forward(self, x, cos, sin, past=None):
         B, S, _ = x.shape
-        sh = lambda t: t.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        def sh(t):
+            return t.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
         q, k, v = sh(self.q_proj(x)), sh(self.k_proj(x)), sh(self.v_proj(x))
+        # cos/sin are built from the (fp32) residual stream; under autocast q/k/v are fp16/bf16. Cast explicitly so
+        # q, k and v enter attention in one dtype instead of relying on autocast to repair a silent fp32 promotion.
+        cos, sin = cos.to(q.dtype), sin.to(q.dtype)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         past_len = 0
         if past is not None:
@@ -79,7 +83,8 @@ class Attention(nn.Module):
             out = F.scaled_dot_product_attention(q, k, v)
         else:  # multi-token continuation (used later for draft verification)
             kv_len = k.shape[2]
-            mask = torch.arange(kv_len, device=x.device)[None, :] <= (past_len + torch.arange(S, device=x.device))[:, None]
+            q_pos = past_len + torch.arange(S, device=x.device)
+            mask = torch.arange(kv_len, device=x.device)[None, :] <= q_pos[:, None]
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         return self.o_proj(out.transpose(1, 2).reshape(B, S, -1)), new_past
 
@@ -165,7 +170,7 @@ class MTPModel(nn.Module):
         hs = [self.norm(z)]
         if self.aux_blocks:
             cos, sin = self._rope(z.shape[1], 0, z.device, z.dtype)
-            for blk, nrm in zip(self.aux_blocks, self.aux_norms):
+            for blk, nrm in zip(self.aux_blocks, self.aux_norms, strict=False):
                 hs.append(nrm(blk(z, cos, sin)[0]))
         return hs
 
